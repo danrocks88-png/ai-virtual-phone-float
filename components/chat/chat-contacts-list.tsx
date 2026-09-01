@@ -229,158 +229,6 @@ export function ChatContactsList({ onCloseApp, onSelectSession, onSelectMascot, 
             <PageShell
                 title="Contacts"
                 onBack={onCloseApp}
-         onPendingAddContactConsumed?: () => void;
-    /** 名片来源的添加页按返回时回到原聊天室 */
-    onPendingAddContactBack?: () => void;
-};
-
-export function ChatContactsList({ onCloseApp, onSelectSession, onSelectMascot, pendingAddContactId, onPendingAddContactConsumed, onPendingAddContactBack }: ChatContactsListProps) {
-    const [contacts, setContacts] = useState<(ChatContact & { char?: Character })[]>([]);
-    const [contactFilter, setContactFilter] = useState("");
-    const [latestPost, setLatestPost] = useState<Record<string, string>>({});
-    const [pendingRequests, setPendingRequests] = useState<FriendRequest[]>([]);
-    const [showRequestList, setShowRequestList] = useState(false);
-    const [selectedRequest, setSelectedRequest] = useState<FriendRequest | null>(null);
-    const [isProcessing, setIsProcessing] = useState(false);
-    const [isAddFriendOpen, setIsAddFriendOpen] = useState(false);
-    const [addQuery, setAddQuery] = useState("");
-    const [addResult, setAddResult] = useState<Character | null | undefined>(undefined);
-    const [isSendingAdd, setIsSendingAdd] = useState(false);
-    const [greetingText, setGreetingText] = useState("");
-    // 添加页是否由名片打开：返回时应回到原聊天室而非联系人列表
-    const addFromCardRef = useRef(false);
-    const mascotSettings = useSyncExternalStore(subscribeMascotSettings, getMascotSettingsSnapshot, getMascotSettingsSnapshot);
-    const [mascotAvatarUrl, setMascotAvatarUrl] = useState(mascotSettings.avatarImage || DEFAULT_MASCOT_AVATAR);
-
-    const identity = useMemo(() => resolveUserIdentity(), []);
-    const chars = useMemo(() => loadCharacters(), []);
-    const deferredContactFilter = useDeferredValue(contactFilter);
-    const bodyRef = useRef<HTMLDivElement>(null);
-    const sectionRefs = useRef<Record<string, HTMLDivElement | null>>({});
-
-    useEffect(() => {
-        let cancelled = false;
-        resolveMascotImageRef(mascotSettings.avatarImage).then((url) => {
-            if (!cancelled) setMascotAvatarUrl(url);
-        });
-        return () => { cancelled = true; };
-    }, [mascotSettings.avatarImage]);
-
-    // 名片点击「添加到通讯录」：phone-chat-app 切到本 tab 后由 prop 传入待添加角色，
-    // 打开添加页并预载资料（本组件仅在 tab 激活时挂载，不能直接监听事件）
-    useEffect(() => {
-        if (!pendingAddContactId) return;
-        const found = loadCharacters().find(c => c.id === pendingAddContactId);
-        onPendingAddContactConsumed?.();
-        if (!found) return;
-        addFromCardRef.current = true;
-        setIsAddFriendOpen(true);
-        setAddQuery(found.wechatID || found.id);
-        setAddResult(found);
-        setIsSendingAdd(false);
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [pendingAddContactId]);
-
-    /** Get the pinyin initial letter (uppercase A-Z), fallback to # */
-    function getInitial(name: string): string {
-        if (!name) return "#";
-        const first = name.charAt(0);
-        // Already A-Z or a-z
-        if (/[a-zA-Z]/.test(first)) return first.toUpperCase();
-        // Chinese → pinyin
-        const py = pinyin(first, { toneType: "none", type: "array" });
-        if (py.length > 0 && /[a-zA-Z]/.test(py[0].charAt(0))) {
-            return py[0].charAt(0).toUpperCase();
-        }
-        return "#";
-    }
-
-    const refresh = useCallback(() => {
-        const rawContacts = loadChatContacts();
-        const enriched = rawContacts.map(c => ({
-            ...c,
-            char: chars.find(ch => ch.id === c.characterId)
-        })).filter(c => c.char);
-        enriched.sort((a, b) => (a.char?.name || "").localeCompare(b.char?.name || ""));
-        setContacts(enriched);
-
-        const posts = loadMomentPosts();
-        const map: Record<string, string> = {};
-        for (const p of posts) {
-            if (!map[p.authorId]) map[p.authorId] = p.content;
-        }
-        setLatestPost(map);
-
-        setPendingRequests(getPendingFriendRequests());
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []);
-
-    useEffect(() => {
-        refresh();
-        const handler = () => refresh();
-        window.addEventListener("friend-requests-updated", handler);
-        return () => window.removeEventListener("friend-requests-updated", handler);
-    }, [refresh]);
-
-    /** Group contacts by pinyin initial */
-    const { grouped, indexLetters } = useMemo(() => {
-        const keyword = deferredContactFilter.trim().toLowerCase();
-        const filtered = keyword
-            ? contacts.filter(c => (c.char?.name || "").toLowerCase().includes(keyword))
-            : contacts;
-        const map: Record<string, typeof contacts> = {};
-        for (const c of filtered) {
-            const letter = getInitial(c.char?.name || "");
-            (map[letter] ??= []).push(c);
-        }
-        // Sort keys: A-Z first, then #
-        const sorted = Object.keys(map).sort((a, b) => {
-            if (a === "#") return 1;
-            if (b === "#") return -1;
-            return a.localeCompare(b);
-        });
-        return { grouped: map, indexLetters: sorted };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [contacts, deferredContactFilter]);
-
-    const handleAccept = async (req: FriendRequest) => {
-        setIsProcessing(true);
-        try {
-            const session = await handleAcceptFriendRequest(req.characterId, req.message);
-            setSelectedRequest(null);
-            setShowRequestList(false);
-            refresh();
-            onSelectSession(session);
-        } catch (err) {
-            console.warn("[Contacts] Accept friend request failed:", err);
-        } finally {
-            setIsProcessing(false);
-        }
-    };
-
-    const handleReject = async (req: FriendRequest) => {
-        setIsProcessing(true);
-        try {
-            updateFriendRequestStatus(req.id, "rejected");
-            dispatchFriendRequestUpdated();
-            setSelectedRequest(null);
-
-            // Trigger AI's next attempt (fire-and-forget)
-            triggerRejectReaction(req.characterId).catch(() => {});
-            refresh();
-        } finally {
-            setIsProcessing(false);
-        }
-    };
-
-    const getCharForRequest = (req: FriendRequest) =>
-        chars.find(c => c.id === req.characterId);
-
-    return (
-        <div className="relative flex-1 h-full">
-            <PageShell
-                title="Contacts"
-                onBack={onCloseApp}
                 bodyRef={bodyRef}
                 rightAction={
                     <button
@@ -404,6 +252,17 @@ export function ChatContactsList({ onCloseApp, onSelectSession, onSelectMascot, 
                 <div className="pt-5 pb-1">
                     <div className="flex items-center justify-between mb-4 mt-2">
                         <span className="ts-28 font-bold text-[var(--c-text-title)]">Contacts</span>
+                        {worldFilterActive && (
+                            <button
+                                type="button"
+                                className="ui-btn ui-btn-ghost ts-13"
+                                style={{ padding: "4px 10px", borderRadius: 999 }}
+                                onClick={() => setShowWorldPicker(true)}
+                                title="切换世界：只显示该世界下的联系人"
+                            >
+                                🌐 {currentWorldGroup?.name || "默认世界"}
+                            </button>
+                        )}
                     </div>
                     <div className="chat-search-bar">
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--c-icon)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
@@ -420,7 +279,7 @@ export function ChatContactsList({ onCloseApp, onSelectSession, onSelectMascot, 
                 <div className="mb-3 mt-3">
                     <div
                         className="minimal-list-item"
-                        onClick={() => pendingRequests.length > 0 && setShowRequestList(true)}
+                        onClick={() => visiblePendingRequests.length > 0 && setShowRequestList(true)}
                     >
                         <div className="w-[48px] h-[48px] rounded-full bg-[var(--c-action-blue,#246bfd)] flex items-center justify-center shrink-0">
                             <svg width={24} height={24} viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
@@ -433,8 +292,8 @@ export function ChatContactsList({ onCloseApp, onSelectSession, onSelectMascot, 
                         <div className="flex-1 overflow-hidden h-[48px] flex flex-col justify-center">
                             <div className="ts-16 font-medium text-[var(--c-text-title)]">New Friends</div>
                         </div>
-                        {pendingRequests.length > 0 && (
-                            <div className="minimal-unread-count ml-auto shrink-0">{pendingRequests.length}</div>
+                        {visiblePendingRequests.length > 0 && (
+                            <div className="minimal-unread-count ml-auto shrink-0">{visiblePendingRequests.length}</div>
                         )}
                     </div>
                 </div>
@@ -471,8 +330,7 @@ export function ChatContactsList({ onCloseApp, onSelectSession, onSelectMascot, 
                                             key={c.id}
                                             onClick={() => {
                                                 const sess = createOrGetSession(char.id);
-                                                onSelectSession(sess);
-                                            }}
+                                                onSelectSession(sess);                                            }}
                                             className="minimal-list-item"
                                         >
                                             <div className="minimal-avatar-wrapper">
@@ -516,6 +374,43 @@ export function ChatContactsList({ onCloseApp, onSelectSession, onSelectMascot, 
                 )}
             </div>
 
+            {/* World Switcher Modal：与角色页的世界卷宗 tab 共用同一份状态 */}
+            {showWorldPicker && (
+                <div className="modal-overlay" onClick={() => setShowWorldPicker(false)}>
+                    <div className="modal-dialog freq-dialog" onClick={e => e.stopPropagation()}>
+                        <div className="ts-17 font-semibold text-center text-[var(--c-text-title)]">
+                            切换世界
+                        </div>
+                        <div className="freq-list">
+                            {worldGroups.map(group => {
+                                const active = group.id === safeWorldId;
+                                return (
+                                    <div
+                                        key={group.id}
+                                        className="freq-list-item"
+                                        onClick={() => {
+                                            setCurrentWorldIdState(group.id);
+                                            setCurrentWorldId(group.id);
+                                            setShowWorldPicker(false);
+                                        }}
+                                    >
+                                        <div className="flex-1 overflow-hidden">
+                                            <div className={`menu-label truncate ${active ? "font-bold" : "font-medium"}`}>
+                                                {active ? "✓ " : ""}{group.name}
+                                            </div>
+                                            <div className="ts-12 text-[var(--c-text)] truncate mt-[2px]">
+                                                {group.memberIds.length} 位角色
+                                            </div>
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                        <button onClick={() => setShowWorldPicker(false)} className="ui-btn ui-btn-ghost w-full">关闭</button>
+                    </div>
+                </div>
+            )}
+
             {/* Friend Request List Modal */}
             {showRequestList && (
                 <div className="modal-overlay" onClick={() => setShowRequestList(false)}>
@@ -523,13 +418,13 @@ export function ChatContactsList({ onCloseApp, onSelectSession, onSelectMascot, 
                         <div className="ts-17 font-semibold text-center text-[var(--c-text-title)]">
                             新的朋友
                         </div>
-                        {pendingRequests.length === 0 ? (
+                        {visiblePendingRequests.length === 0 ? (
                             <div className="py-6 text-center text-[var(--c-text)] ts-14">
                                 暂无好友申请
                             </div>
                         ) : (
                             <div className="freq-list">
-                                {pendingRequests.map(req => {
+                                {visiblePendingRequests.map(req => {
                                     const char = getCharForRequest(req);
                                     return (
                                         <div
