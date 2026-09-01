@@ -8,6 +8,15 @@ import { loadCharacters } from "@/lib/character-storage";
 import { Character } from "@/lib/character-types";
 import { loadMomentPosts } from "@/lib/moments-storage";
 import {
+    loadCharacterWorldGroups,
+    getCurrentWorldId,
+    setCurrentWorldId,
+    CHARACTER_WORLDS_UPDATED_EVENT,
+    CURRENT_WORLD_CHANGED_EVENT,
+    DEFAULT_CHARACTER_WORLD_ID,
+    type CharacterWorldGroup,
+} from "@/lib/character-world-storage";
+import {
     getPendingFriendRequests,
     clearRequestsForCharacter,
     updateFriendRequestStatus,
@@ -35,6 +44,192 @@ type ChatContactsListProps = {
     /** 名片点击「加好友」：切到本 tab 后待打开添加页的角色 id */
     pendingAddContactId?: string | null;
     onPendingAddContactConsumed?: () => void;
+    /** 名片来源的添加页按返回时回到原聊天室 */
+    onPendingAddContactBack?: () => void;
+};
+
+export function ChatContactsList({ onCloseApp, onSelectSession, onSelectMascot, pendingAddContactId, onPendingAddContactConsumed, onPendingAddContactBack }: ChatContactsListProps) {
+    const [contacts, setContacts] = useState<(ChatContact & { char?: Character })[]>([]);
+    const [contactFilter, setContactFilter] = useState("");
+    const [latestPost, setLatestPost] = useState<Record<string, string>>({});
+    const [pendingRequests, setPendingRequests] = useState<FriendRequest[]>([]);
+    const [showRequestList, setShowRequestList] = useState(false);
+    const [selectedRequest, setSelectedRequest] = useState<FriendRequest | null>(null);
+    const [isProcessing, setIsProcessing] = useState(false);
+    const [isAddFriendOpen, setIsAddFriendOpen] = useState(false);
+    const [addQuery, setAddQuery] = useState("");
+    const [addResult, setAddResult] = useState<Character | null | undefined>(undefined);
+    const [isSendingAdd, setIsSendingAdd] = useState(false);
+    const [greetingText, setGreetingText] = useState("");
+    // 添加页是否由名片打开：返回时应回到原聊天室而非联系人列表
+    const addFromCardRef = useRef(false);
+    const mascotSettings = useSyncExternalStore(subscribeMascotSettings, getMascotSettingsSnapshot, getMascotSettingsSnapshot);
+    const [mascotAvatarUrl, setMascotAvatarUrl] = useState(mascotSettings.avatarImage || DEFAULT_MASCOT_AVATAR);
+
+    // 按世界分区：角色页切世界 tab 时会广播 CURRENT_WORLD_CHANGED_EVENT，
+    // 这里同步读取同一个 key，联系人列表只展示当前世界的角色，其余世界的联系人临时“消失”。
+    const [worldGroups, setWorldGroups] = useState<CharacterWorldGroup[]>(() => loadCharacterWorldGroups());
+    const [currentWorldId, setCurrentWorldIdState] = useState<string>(() => getCurrentWorldId());
+    const [showWorldPicker, setShowWorldPicker] = useState(false);
+    useEffect(() => {
+        const reloadGroups = () => setWorldGroups(loadCharacterWorldGroups());
+        const reloadCurrent = () => setCurrentWorldIdState(getCurrentWorldId());
+        window.addEventListener(CHARACTER_WORLDS_UPDATED_EVENT, reloadGroups);
+        window.addEventListener(CURRENT_WORLD_CHANGED_EVENT, reloadCurrent);
+        return () => {
+            window.removeEventListener(CHARACTER_WORLDS_UPDATED_EVENT, reloadGroups);
+            window.removeEventListener(CURRENT_WORLD_CHANGED_EVENT, reloadCurrent);
+        };
+    }, []);
+    // 记忆的世界可能已被删除 → 回落默认世界
+    const safeWorldId = worldGroups.some(g => g.id === currentWorldId) ? currentWorldId : DEFAULT_CHARACTER_WORLD_ID;
+    const currentWorldGroup = worldGroups.find(g => g.id === safeWorldId) ?? null;
+    // 只有真正建立了多个世界（或默认世界之外还有内容）时才启用分区展示，
+    // 避免只有一个默认世界的用户平白多出一层过滤/按钮。
+    const worldFilterActive = worldGroups.length > 1;
+    const currentWorldMemberIds = useMemo(
+        () => new Set(currentWorldGroup?.memberIds ?? []),
+        [currentWorldGroup]
+    );
+
+    const identity = useMemo(() => resolveUserIdentity(), []);
+    const chars = useMemo(() => loadCharacters(), []);
+    const deferredContactFilter = useDeferredValue(contactFilter);
+    const bodyRef = useRef<HTMLDivElement>(null);
+    const sectionRefs = useRef<Record<string, HTMLDivElement | null>>({});
+
+    useEffect(() => {
+        let cancelled = false;
+        resolveMascotImageRef(mascotSettings.avatarImage).then((url) => {
+            if (!cancelled) setMascotAvatarUrl(url);
+        });
+        return () => { cancelled = true; };
+    }, [mascotSettings.avatarImage]);
+
+    // 名片点击「添加到通讯录」：phone-chat-app 切到本 tab 后由 prop 传入待添加角色，
+    // 打开添加页并预载资料（本组件仅在 tab 激活时挂载，不能直接监听事件）
+    useEffect(() => {
+        if (!pendingAddContactId) return;
+        const found = loadCharacters().find(c => c.id === pendingAddContactId);
+        onPendingAddContactConsumed?.();
+        if (!found) return;
+        addFromCardRef.current = true;
+        setIsAddFriendOpen(true);
+        setAddQuery(found.wechatID || found.id);
+        setAddResult(found);
+        setIsSendingAdd(false);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [pendingAddContactId]);
+
+    /** Get the pinyin initial letter (uppercase A-Z), fallback to # */
+    function getInitial(name: string): string {
+        if (!name) return "#";
+        const first = name.charAt(0);
+        // Already A-Z or a-z
+        if (/[a-zA-Z]/.test(first)) return first.toUpperCase();
+        // Chinese → pinyin
+        const py = pinyin(first, { toneType: "none", type: "array" });
+        if (py.length > 0 && /[a-zA-Z]/.test(py[0].charAt(0))) {
+            return py[0].charAt(0).toUpperCase();
+        }
+        return "#";
+    }
+
+    const refresh = useCallback(() => {
+        const rawContacts = loadChatContacts();
+        const enriched = rawContacts.map(c => ({
+            ...c,
+            char: chars.find(ch => ch.id === c.characterId)
+        })).filter(c => c.char);
+        enriched.sort((a, b) => (a.char?.name || "").localeCompare(b.char?.name || ""));
+        setContacts(enriched);
+
+        const posts = loadMomentPosts();
+        const map: Record<string, string> = {};
+        for (const p of posts) {
+            if (!map[p.authorId]) map[p.authorId] = p.content;
+        }
+        setLatestPost(map);
+
+        setPendingRequests(getPendingFriendRequests());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    useEffect(() => {
+        refresh();
+        const handler = () => refresh();
+        window.addEventListener("friend-requests-updated", handler);
+        return () => window.removeEventListener("friend-requests-updated", handler);
+    }, [refresh]);
+
+    /** Group contacts by pinyin initial */
+    const { grouped, indexLetters } = useMemo(() => {
+        const keyword = deferredContactFilter.trim().toLowerCase();
+        const worldScoped = worldFilterActive
+            ? contacts.filter(c => c.char && currentWorldMemberIds.has(c.char.id))
+            : contacts;
+        const filtered = keyword
+            ? worldScoped.filter(c => (c.char?.name || "").toLowerCase().includes(keyword))
+            : worldScoped;
+        const map: Record<string, typeof contacts> = {};
+        for (const c of filtered) {
+            const letter = getInitial(c.char?.name || "");
+            (map[letter] ??= []).push(c);
+        }
+        // Sort keys: A-Z first, then #
+        const sorted = Object.keys(map).sort((a, b) => {
+            if (a === "#") return 1;
+            if (b === "#") return -1;
+            return a.localeCompare(b);
+        });
+        return { grouped: map, indexLetters: sorted };
+    }, [contacts, deferredContactFilter, worldFilterActive, currentWorldMemberIds]);
+
+    // 新的朋友申请也按当前世界过滤：切到「2世界」时不该看见「1世界」角色发来的申请
+    const visiblePendingRequests = useMemo(() => {
+        if (!worldFilterActive) return pendingRequests;
+        return pendingRequests.filter(req => currentWorldMemberIds.has(req.characterId));
+    }, [pendingRequests, worldFilterActive, currentWorldMemberIds]);
+
+    const handleAccept = async (req: FriendRequest) => {
+        setIsProcessing(true);
+        try {
+            const session = await handleAcceptFriendRequest(req.characterId, req.message);
+            setSelectedRequest(null);
+            setShowRequestList(false);
+            refresh();
+            onSelectSession(session);
+        } catch (err) {
+            console.warn("[Contacts] Accept friend request failed:", err);
+        } finally {
+            setIsProcessing(false);
+        }
+    };
+
+    const handleReject = async (req: FriendRequest) => {
+        setIsProcessing(true);
+        try {
+            updateFriendRequestStatus(req.id, "rejected");
+            dispatchFriendRequestUpdated();
+            setSelectedRequest(null);
+
+            // Trigger AI's next attempt (fire-and-forget)
+            triggerRejectReaction(req.characterId).catch(() => {});
+            refresh();
+        } finally {
+            setIsProcessing(false);
+        }
+    };
+
+    const getCharForRequest = (req: FriendRequest) =>
+        chars.find(c => c.id === req.characterId);
+
+    return (
+        <div className="relative flex-1 h-full">
+            <PageShell
+                title="Contacts"
+                onBack={onCloseApp}
+         onPendingAddContactConsumed?: () => void;
     /** 名片来源的添加页按返回时回到原聊天室 */
     onPendingAddContactBack?: () => void;
 };
